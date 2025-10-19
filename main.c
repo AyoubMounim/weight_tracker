@@ -1,18 +1,25 @@
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#define WT_DEFAULT_DATA_DIR ".local/share/wt"
+
+#define WEIGHT_HISTORY_DEFAULT_FILE ".local/share/wt/weight_history.csv"
+
+#define FILE_PATH_MAX_SIZE 128
 
 enum wt_cmd_tag {
   WT_CMD_LOG_WEIGHT,
 };
 
-#define FILE_PATH_MAX_SIZE 64
 struct wt_cmd_log_weight_args {
   float weight;
   char file_path[FILE_PATH_MAX_SIZE];
@@ -79,10 +86,37 @@ static int parse_args(int argc, char *argv[], struct wt_cmd *cmd) {
     cmd->tag = WT_CMD_LOG_WEIGHT;
     cmd->execute_func = log_weight;
     cmd->log_weight_args.weight = strtof(argv[2], NULL);
-    snprintf(cmd->log_weight_args.file_path, FILE_PATH_MAX_SIZE, "%s",
-             "/home/ayoub/.local/share/wt/data.csv");
+    char const *home = getenv("HOME");
+    int length = snprintf(cmd->log_weight_args.file_path, FILE_PATH_MAX_SIZE,
+                          "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+    if (length == FILE_PATH_MAX_SIZE) {
+      res = -1;
+      goto exit;
+    }
     res = 0;
     goto exit;
+  }
+exit:
+  return res;
+}
+
+static int wt_init(void) {
+  int res = 0;
+  char const *home = getenv("HOME");
+  char data_dir[FILE_PATH_MAX_SIZE];
+  int length =
+      snprintf(data_dir, sizeof(data_dir), "%s/%s", home, WT_DEFAULT_DATA_DIR);
+  if (length == sizeof(data_dir)) {
+    res = -1;
+    goto exit;
+  }
+  res = mkdir(data_dir, S_IRWXU);
+  if (res < 0) {
+    if (errno == EEXIST) {
+      res = 0;
+    } else {
+      res = -1;
+    }
   }
 exit:
   return res;
@@ -93,6 +127,11 @@ int main(int argc, char *argv[]) {
   int res = parse_args(argc, argv, &cmd);
   if (res != 0) {
     fprintf(stderr, "args parse failed\n");
+    goto exit;
+  }
+  res = wt_init();
+  if (res != 0) {
+    fprintf(stderr, "init failed\n");
     goto exit;
   }
   res = wt_cmd_execute(&cmd);
