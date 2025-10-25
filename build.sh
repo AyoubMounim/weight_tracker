@@ -4,4 +4,4 @@ BUILD_DIR=build
 
 [[ -d "$BUILD_DIR" ]] || mkdir -p "$BUILD_DIR"
 
-gcc -ggdb main.c -o "$BUILD_DIR/wt"
+gcc -ggdb main.c -o "$BUILD_DIR/wt" -lm

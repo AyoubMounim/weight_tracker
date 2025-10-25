@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,13 +58,64 @@ struct wt_stats {
   speed rate_of_change;
 };
 
-static int wt_stats_from_history(struct wt_stats *self, size_t history_length,
-                                 float const history[history_length]) {
-  if (history_length == 0) {
+struct linear_fit_coeff {
+  float m;
+  float q;
+};
+
+static float compute_skx(size_t data_length, float const x[data_length],
+                         uint32_t k) {
+  float res = 0;
+  for (size_t i = 0; i < data_length; i++) {
+    res += powf(x[i], k);
+  }
+  return res;
+}
+
+static float compute_skxy(size_t data_length, float const x[data_length],
+                          float const y[data_length], uint32_t k) {
+  float res = 0;
+  for (size_t i = 0; i < data_length; i++) {
+    res += powf(x[i], k) * y[i];
+  }
+  return res;
+}
+
+static float compute_s0xy(size_t data_length, float const x[data_length],
+                          float const y[data_length]) {
+  float res = 0;
+  for (size_t i = 0; i < data_length; i++) {
+    res += y[i];
+  }
+  return res;
+}
+
+static int linear_fit(size_t data_length, float const data[data_length],
+                      struct linear_fit_coeff *linear_fit) {
+  if (data_length == 0) {
     return -1;
   }
-  self->rate_of_change =
-      (history[history_length - 1] - history[0]) / history_length;
+  float *x = calloc(data_length, sizeof(*x));
+  for (size_t i = 0; i < data_length; i++) {
+    x[i] = i;
+  }
+  float const s0x = (float)data_length;
+  float const s1x = data_length*(data_length-1)/2.0;
+  float const s2x = data_length*(data_length-1)*(2*data_length - 1)/6.0;
+  float const s0xy = compute_s0xy(data_length, x, data);
+  float const s1xy = compute_skxy(data_length, x, data, 1);
+  linear_fit->m = (s0x * s1xy - s1x * s0xy) / (s0x * s2x - s1x * s1x);
+  linear_fit->q = (s0xy * s2x - s1xy * s1x) / (s0x * s2x - s1x * s1x);
+  return 0;
+}
+
+static int wt_stats_from_history(struct wt_stats *self, size_t history_length,
+                                 float const history[history_length]) {
+  struct linear_fit_coeff lfit = {0};
+  if (linear_fit(history_length, history, &lfit) < 0) {
+    return -1;
+  }
+  self->rate_of_change = lfit.m;
   return 0;
 }
 
@@ -124,7 +176,8 @@ exit:
   return res;
 }
 
-static ssize_t avg_get_history(char const *history_file_path, float **history) {
+static ssize_t wt_get_weight_history(char const *history_file_path,
+                                     float **history) {
   int res = 0;
   FILE *f = fopen(history_file_path, "r");
   if (f == NULL) {
@@ -166,30 +219,67 @@ exit:
   return res;
 }
 
-void avg_free_history(float **history) {
+static void wt_free_weight_history(float **history) {
   free(*history);
   *history = NULL;
+  return;
+}
+
+static ssize_t wt_moving_avg(size_t data_length, float data[data_length],
+                             size_t avg_window_length, float **data_avg) {
+  int res = 0;
+  if (data_length < avg_window_length) {
+    res = -1;
+    goto exit;
+  }
+  *data_avg = calloc(data_length - avg_window_length + 1, sizeof(**data_avg));
+  if (data_avg == NULL) {
+    res = -1;
+    goto exit;
+  }
+  for (size_t i = 0; i + avg_window_length - 1 < data_length; i++) {
+    float sum = 0;
+    for (size_t j = 0; j < avg_window_length; j++) {
+      sum += data[i + j];
+    }
+    float const avg = sum / avg_window_length;
+    (*data_avg)[i] = avg;
+  }
+  res = data_length - avg_window_length + 1;
+exit:
+  return res;
+}
+
+static void wt_free_moving_avg(float **data) {
+  free(*data);
+  *data = NULL;
   return;
 }
 
 static int avg(void const *args) {
   int res = 0;
   struct wt_cmd_avg_args const *avg_args = args;
-  float *history;
-  ssize_t history_length = avg_get_history(avg_args->file_path, &history);
+  float *history = NULL;
+  ssize_t history_length = wt_get_weight_history(avg_args->file_path, &history);
   if (history_length < 0) {
     res = -1;
     goto exit;
   }
-  for (size_t i = 0; i + avg_args->avg_window_days - 1 < history_length; i++) {
-    float sum = 0;
-    for (size_t j = 0; j < avg_args->avg_window_days; j++) {
-      sum += history[i + j];
-    }
-    float const weight_avg = sum / avg_args->avg_window_days;
-    printf("avg weight: %f\n", weight_avg);
+  float *history_avg = NULL;
+  ssize_t history_avg_length = wt_moving_avg(
+      history_length, history, avg_args->avg_window_days, &history_avg);
+  if (history_avg_length < 0) {
+    res = -1;
+    goto cleanup;
   }
-  avg_free_history(&history);
+  printf("===\n[Moving Average Weight History]\n");
+  for (size_t i = 0; i < history_avg_length; i++) {
+    printf("  %.2f Kg\n", history_avg[i]);
+  }
+  printf("===\n");
+cleanup:
+  wt_free_weight_history(&history);
+  wt_free_moving_avg(&history_avg);
 exit:
   return res;
 }
@@ -198,30 +288,23 @@ static int stats(void const *args) {
   int res = 0;
   struct wt_cmd_stats_args const *stats_args = args;
   float *history;
-  ssize_t history_length = avg_get_history(stats_args->file_path, &history);
+  ssize_t history_length =
+      wt_get_weight_history(stats_args->file_path, &history);
   if (history_length < 0) {
     res = -1;
     goto exit;
   }
   if (history_length < stats_args->avg_window_days) {
     printf("Not enough data to show stats.\n");
-    res = -1;
+    res = 0;
     goto exit;
   }
-  float *history_avg = calloc(history_length - stats_args->avg_window_days + 1,
-                              sizeof(*history_avg));
-  if (history_avg == NULL) {
+  float *history_avg = NULL;
+  ssize_t history_avg_length = wt_moving_avg(
+      history_length, history, stats_args->avg_window_days, &history_avg);
+  if (history_avg_length < 0) {
     res = -1;
-    goto exit;
-  }
-  for (size_t i = 0; i + stats_args->avg_window_days - 1 < history_length;
-       i++) {
-    float sum = 0;
-    for (size_t j = 0; j < stats_args->avg_window_days; j++) {
-      sum += history[i + j];
-    }
-    float const weight_avg = sum / stats_args->avg_window_days;
-    history_avg[i] = weight_avg;
+    goto cleanup;
   }
   struct wt_stats stats;
   if (wt_stats_from_history(&stats, history_length, history) < 0) {
@@ -229,8 +312,10 @@ static int stats(void const *args) {
     goto cleanup;
   }
   wt_stats_print(&stats);
+  res = 0;
 cleanup:
-  avg_free_history(&history);
+  wt_free_weight_history(&history);
+  wt_free_moving_avg(&history_avg);
   free(history_avg);
 exit:
   return res;
