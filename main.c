@@ -1,7 +1,9 @@
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,17 +13,31 @@
 #include <unistd.h>
 
 #define WT_DEFAULT_DATA_DIR ".local/share/wt"
-
 #define WEIGHT_HISTORY_DEFAULT_FILE ".local/share/wt/weight_history.csv"
+
+#define WT_AVG_DEFAULT_WINDOW_LENGTH_DAYS 7
 
 #define FILE_PATH_MAX_SIZE 128
 
 enum wt_cmd_tag {
   WT_CMD_LOG_WEIGHT,
+  WT_CMD_AVG,
+  WT_CMD_STATS,
+  WT_CMDS_NUMBER,
 };
 
 struct wt_cmd_log_weight_args {
   float weight;
+  char file_path[FILE_PATH_MAX_SIZE];
+};
+
+struct wt_cmd_avg_args {
+  uint8_t avg_window_days;
+  char file_path[FILE_PATH_MAX_SIZE];
+};
+
+struct wt_cmd_stats_args {
+  uint8_t avg_window_days;
   char file_path[FILE_PATH_MAX_SIZE];
 };
 
@@ -30,14 +46,46 @@ struct wt_cmd {
   int (*execute_func)(void const *);
   union {
     struct wt_cmd_log_weight_args log_weight_args;
+    struct wt_cmd_avg_args avg_args;
+    struct wt_cmd_stats_args stats_args;
   };
 };
+
+typedef float speed; ///< kg/day.
+
+struct wt_stats {
+  speed rate_of_change;
+};
+
+static int wt_stats_from_history(struct wt_stats *self, size_t history_length,
+                                 float const history[history_length]) {
+  if (history_length == 0) {
+    return -1;
+  }
+  self->rate_of_change =
+      (history[history_length - 1] - history[0]) / history_length;
+  return 0;
+}
+
+static void wt_stats_print(struct wt_stats const *self) {
+  printf("===\n"
+         "[Stats]\n"
+         "  rate of change: %.2f Kg/day\n"
+         "===\n",
+         self->rate_of_change);
+}
 
 static int wt_cmd_execute(struct wt_cmd const *cmd) {
   int res = -1;
   switch (cmd->tag) {
   case WT_CMD_LOG_WEIGHT:
     res = cmd->execute_func((void *)&cmd->log_weight_args);
+    break;
+  case WT_CMD_AVG:
+    res = cmd->execute_func((void *)&cmd->avg_args);
+    break;
+  case WT_CMD_STATS:
+    res = cmd->execute_func((void *)&cmd->stats_args);
     break;
   default:
     res = -1;
@@ -76,25 +124,174 @@ exit:
   return res;
 }
 
+static ssize_t avg_get_history(char const *history_file_path, float **history) {
+  int res = 0;
+  FILE *f = fopen(history_file_path, "r");
+  if (f == NULL) {
+    res = -1;
+    goto exit;
+  }
+  char *line = NULL;
+  size_t length = 0;
+  ssize_t r;
+  size_t history_length = 0;
+  size_t history_capacity = 128;
+  *history = calloc(history_capacity, sizeof(**history));
+  if (*history == NULL) {
+    res = -1;
+    goto cleanup;
+  }
+  while ((r = getline(&line, &length, f)) >= 0) {
+    char const *date = strtok(line, ",");
+    char const *weight_str = strtok(NULL, ",");
+    if (weight_str == NULL) {
+      continue;
+    }
+    float const weight = strtof(weight_str, NULL);
+    if (history_length == history_capacity) {
+      history_capacity *= 2;
+      *history = realloc(*history, history_capacity);
+      if (*history == NULL) {
+        res = -1;
+        goto cleanup;
+      }
+    }
+    (*history)[history_length++] = weight;
+  }
+  res = history_length;
+cleanup:
+  fclose(f);
+  free(line);
+exit:
+  return res;
+}
+
+void avg_free_history(float **history) {
+  free(*history);
+  *history = NULL;
+  return;
+}
+
+static int avg(void const *args) {
+  int res = 0;
+  struct wt_cmd_avg_args const *avg_args = args;
+  float *history;
+  ssize_t history_length = avg_get_history(avg_args->file_path, &history);
+  if (history_length < 0) {
+    res = -1;
+    goto exit;
+  }
+  for (size_t i = 0; i + avg_args->avg_window_days - 1 < history_length; i++) {
+    float sum = 0;
+    for (size_t j = 0; j < avg_args->avg_window_days; j++) {
+      sum += history[i + j];
+    }
+    float const weight_avg = sum / avg_args->avg_window_days;
+    printf("avg weight: %f\n", weight_avg);
+  }
+  avg_free_history(&history);
+exit:
+  return res;
+}
+
+static int stats(void const *args) {
+  int res = 0;
+  struct wt_cmd_stats_args const *stats_args = args;
+  float *history;
+  ssize_t history_length = avg_get_history(stats_args->file_path, &history);
+  if (history_length < 0) {
+    res = -1;
+    goto exit;
+  }
+  if (history_length < stats_args->avg_window_days) {
+    printf("Not enough data to show stats.\n");
+    res = -1;
+    goto exit;
+  }
+  float *history_avg = calloc(history_length - stats_args->avg_window_days + 1,
+                              sizeof(*history_avg));
+  if (history_avg == NULL) {
+    res = -1;
+    goto exit;
+  }
+  for (size_t i = 0; i + stats_args->avg_window_days - 1 < history_length;
+       i++) {
+    float sum = 0;
+    for (size_t j = 0; j < stats_args->avg_window_days; j++) {
+      sum += history[i + j];
+    }
+    float const weight_avg = sum / stats_args->avg_window_days;
+    history_avg[i] = weight_avg;
+  }
+  struct wt_stats stats;
+  if (wt_stats_from_history(&stats, history_length, history) < 0) {
+    res = -1;
+    goto cleanup;
+  }
+  wt_stats_print(&stats);
+cleanup:
+  avg_free_history(&history);
+  free(history_avg);
+exit:
+  return res;
+}
+
 static int parse_args(int argc, char *argv[], struct wt_cmd *cmd) {
   int res = -1;
-  if (argc != 3) {
+  if (argc < 2) {
     res = -1;
     goto exit;
   }
   if (strcmp(argv[1], "log") == 0) {
-    cmd->tag = WT_CMD_LOG_WEIGHT;
-    cmd->execute_func = log_weight;
-    cmd->log_weight_args.weight = strtof(argv[2], NULL);
-    char const *home = getenv("HOME");
-    int length = snprintf(cmd->log_weight_args.file_path, FILE_PATH_MAX_SIZE,
-                          "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
-    if (length == FILE_PATH_MAX_SIZE) {
-      res = -1;
-      goto exit;
+    if (argc == 3) {
+      cmd->tag = WT_CMD_LOG_WEIGHT;
+      cmd->execute_func = log_weight;
+      cmd->log_weight_args.weight = strtof(argv[2], NULL);
+      char const *home = getenv("HOME");
+      int length = snprintf(cmd->log_weight_args.file_path, FILE_PATH_MAX_SIZE,
+                            "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+      if (length == FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+    } else {
+      assert(0 && "not implemented");
     }
     res = 0;
-    goto exit;
+  } else if (strcmp(argv[1], "avg") == 0) {
+    cmd->tag = WT_CMD_AVG;
+    cmd->execute_func = avg;
+    if (argc == 2) {
+      cmd->avg_args.avg_window_days = WT_AVG_DEFAULT_WINDOW_LENGTH_DAYS;
+      char const *home = getenv("HOME");
+      int length = snprintf(cmd->avg_args.file_path, FILE_PATH_MAX_SIZE,
+                            "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+      if (length == FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+    } else {
+      assert(0 && "not implemented");
+    }
+    res = 0;
+  } else if (strcmp(argv[1], "stats") == 0) {
+    cmd->tag = WT_CMD_STATS;
+    cmd->execute_func = stats;
+    if (argc == 2) {
+      cmd->stats_args.avg_window_days = WT_AVG_DEFAULT_WINDOW_LENGTH_DAYS;
+      char const *home = getenv("HOME");
+      int length = snprintf(cmd->stats_args.file_path, FILE_PATH_MAX_SIZE,
+                            "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+      if (length == FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+    } else {
+      assert(0 && "not implemented");
+    }
+    res = 0;
+  } else {
+    res = -1;
   }
 exit:
   return res;
