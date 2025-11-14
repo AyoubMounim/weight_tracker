@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <readline/readline.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 
 enum wt_cmd_tag {
   WT_CMD_LOG_WEIGHT,
+  WT_CMD_LOG_DATA,
   WT_CMD_AVG,
   WT_CMD_STATS,
   WT_CMDS_NUMBER,
@@ -29,6 +31,18 @@ enum wt_cmd_tag {
 
 struct wt_cmd_log_weight_args {
   float weight;
+  char file_path[FILE_PATH_MAX_SIZE];
+};
+
+struct wt_data {
+  float weight_kg;
+  float body_fat_percent;
+  float water_mass_percent;
+  float muscle_mass_percent;
+};
+
+struct wt_cmd_log_data_args {
+  struct wt_data data;
   char file_path[FILE_PATH_MAX_SIZE];
 };
 
@@ -47,6 +61,7 @@ struct wt_cmd {
   int (*execute_func)(void const *);
   union {
     struct wt_cmd_log_weight_args log_weight_args;
+    struct wt_cmd_log_data_args log_data_args;
     struct wt_cmd_avg_args avg_args;
     struct wt_cmd_stats_args stats_args;
   };
@@ -100,8 +115,9 @@ static int linear_fit(size_t data_length, float const data[data_length],
     x[i] = i;
   }
   float const s0x = (float)data_length;
-  float const s1x = data_length*(data_length-1)/2.0;
-  float const s2x = data_length*(data_length-1)*(2*data_length - 1)/6.0;
+  float const s1x = data_length * (data_length - 1) / 2.0;
+  float const s2x =
+      data_length * (data_length - 1) * (2 * data_length - 1) / 6.0;
   float const s0xy = compute_s0xy(data_length, x, data);
   float const s1xy = compute_skxy(data_length, x, data, 1);
   linear_fit->m = (s0x * s1xy - s1x * s0xy) / (s0x * s2x - s1x * s1x);
@@ -133,6 +149,9 @@ static int wt_cmd_execute(struct wt_cmd const *cmd) {
   case WT_CMD_LOG_WEIGHT:
     res = cmd->execute_func((void *)&cmd->log_weight_args);
     break;
+  case WT_CMD_LOG_DATA:
+    res = cmd->execute_func((void *)&cmd->log_data_args);
+    break;
   case WT_CMD_AVG:
     res = cmd->execute_func((void *)&cmd->avg_args);
     break;
@@ -156,7 +175,16 @@ static size_t log_weight_format_std(time_t unix_time, float weight,
                                     size_t buff_size, char buff[buff_size]) {
   char date_buff[32];
   strftime(date_buff, sizeof(date_buff), "%d/%m/%Y", localtime(&unix_time));
-  return snprintf(buff, buff_size, "%s,%.2f\n", date_buff, weight);
+  return snprintf(buff, buff_size, "%s,%.2f,NA,NA,NA\n", date_buff, weight);
+}
+
+static size_t log_data_format_std(time_t unix_time, struct wt_data const *data,
+                                  size_t buff_size, char buff[buff_size]) {
+  char date_buff[32];
+  strftime(date_buff, sizeof(date_buff), "%d/%m/%Y", localtime(&unix_time));
+  return snprintf(buff, buff_size, "%s,%.2f,%.2f,%.2f,%.2f\n", date_buff,
+                  data->weight_kg, data->body_fat_percent,
+                  data->muscle_mass_percent, data->water_mass_percent);
 }
 
 static int log_weight(void const *args) {
@@ -167,9 +195,60 @@ static int log_weight(void const *args) {
     res = -1;
     goto exit;
   }
-  char buff[32];
+  char buff[256];
   size_t length = log_weight_format_std(time(NULL), log_weight_args->weight,
                                         sizeof(buff), buff);
+  write(fd, buff, length);
+  close(fd);
+exit:
+  return res;
+}
+
+static int wt_data_from_stdin(struct wt_data *data) {
+  int res = 0;
+  char *buffer = readline("Weight (Kg): ");
+  if (buffer == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->weight_kg = strtof(buffer, NULL);
+  free(buffer);
+  buffer = readline("Body fat (%): ");
+  if (buffer == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->body_fat_percent = strtof(buffer, NULL);
+  free(buffer);
+  buffer = readline("Water mass (%): ");
+  if (buffer == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->water_mass_percent = strtof(buffer, NULL);
+  free(buffer);
+  buffer = readline("Muscle mass (%): ");
+  if (buffer == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->muscle_mass_percent = strtof(buffer, NULL);
+  free(buffer);
+exit:
+  return res;
+}
+
+static int log_data(void const *args) {
+  int res = 0;
+  struct wt_cmd_log_data_args const *log_data_args = args;
+  int fd = log_weight_get_fd(log_data_args->file_path);
+  if (fd < 0) {
+    res = -1;
+    goto exit;
+  }
+  char buff[256];
+  size_t length =
+      log_data_format_std(time(NULL), &log_data_args->data, sizeof(buff), buff);
   write(fd, buff, length);
   close(fd);
 exit:
@@ -334,6 +413,21 @@ static int parse_args(int argc, char *argv[], struct wt_cmd *cmd) {
       cmd->log_weight_args.weight = strtof(argv[2], NULL);
       char const *home = getenv("HOME");
       int length = snprintf(cmd->log_weight_args.file_path, FILE_PATH_MAX_SIZE,
+                            "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+      if (length == FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+    } else if (argc == 2) {
+      cmd->tag = WT_CMD_LOG_DATA;
+      cmd->execute_func = log_data;
+      fprintf(stdout, "*** Please enter data...\n");
+      if (wt_data_from_stdin(&cmd->log_data_args.data) != 0) {
+        res = -1;
+        goto exit;
+      }
+      char const *home = getenv("HOME");
+      int length = snprintf(cmd->log_data_args.file_path, FILE_PATH_MAX_SIZE,
                             "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
       if (length == FILE_PATH_MAX_SIZE) {
         res = -1;
