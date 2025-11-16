@@ -212,8 +212,15 @@ static int wt_cmd_execute(struct wt_cmd const *cmd) {
 }
 
 static int log_weight_get_fd(char const *path) {
-  int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU);
-  //  int fd = fileno(stdout);
+  int fd;
+  if (access(path, F_OK) != 0) {
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU);
+    static char const *header =
+        "weight_kg,body_fat_percent,muscle_mass_percent,water_mass_percent\n";
+    write(fd, header, strlen(header));
+  } else {
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU);
+  }
   return fd;
 }
 
