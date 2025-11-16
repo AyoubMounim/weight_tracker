@@ -67,10 +67,13 @@ struct wt_cmd {
   };
 };
 
-typedef float speed; ///< kg/day.
+typedef float speed; ///< 1/day.
 
 struct wt_stats {
-  speed rate_of_change;
+  speed weight_kg_rate_of_change;
+  speed body_fat_percent_rate_of_change;
+  speed muscle_mass_percent_rate_of_change;
+  speed water_mass_percent_rate_of_change;
 };
 
 struct linear_fit_coeff {
@@ -122,25 +125,68 @@ static int linear_fit(size_t data_length, float const data[data_length],
   float const s1xy = compute_skxy(data_length, x, data, 1);
   linear_fit->m = (s0x * s1xy - s1x * s0xy) / (s0x * s2x - s1x * s1x);
   linear_fit->q = (s0xy * s2x - s1xy * s1x) / (s0x * s2x - s1x * s1x);
+  free(x);
   return 0;
 }
 
+#define wt_load_data(dst, data, data_len, attr)                                \
+  size_t attr##_length = 0;                                                    \
+  for (size_t i = 0; i < data_len; i++) {                                      \
+    if (isnan(data[i].attr)) {                                                 \
+      continue;                                                                \
+    }                                                                          \
+    dst[i] = data[i].attr;                                                     \
+    attr##_length++;                                                           \
+  }
+
 static int wt_stats_from_history(struct wt_stats *self, size_t history_length,
-                                 float const history[history_length]) {
-  struct linear_fit_coeff lfit = {0};
-  if (linear_fit(history_length, history, &lfit) < 0) {
+                                 struct wt_data const history[history_length]) {
+  int res = 0;
+  float *data = calloc(history_length, sizeof(*data));
+  if (data == NULL) {
     return -1;
   }
-  self->rate_of_change = lfit.m;
-  return 0;
+  struct linear_fit_coeff lfit = {0};
+  wt_load_data(data, history, history_length, weight_kg);
+  if (linear_fit(weight_kg_length, data, &lfit) < 0) {
+    res = -1;
+    goto cleanup;
+  }
+  self->weight_kg_rate_of_change = lfit.m;
+  wt_load_data(data, history, history_length, body_fat_percent);
+  if (linear_fit(body_fat_percent_length, data, &lfit) < 0) {
+    res = -1;
+    goto cleanup;
+  }
+  self->body_fat_percent_rate_of_change = lfit.m;
+  wt_load_data(data, history, history_length, muscle_mass_percent);
+  if (linear_fit(muscle_mass_percent_length, data, &lfit) < 0) {
+    res = -1;
+    goto cleanup;
+  }
+  self->muscle_mass_percent_rate_of_change = lfit.m;
+  wt_load_data(data, history, history_length, water_mass_percent);
+  if (linear_fit(water_mass_percent_length, data, &lfit) < 0) {
+    res = -1;
+    goto cleanup;
+  }
+  self->water_mass_percent_rate_of_change = lfit.m;
+cleanup:
+  free(data);
+  return res;
 }
 
 static void wt_stats_print(struct wt_stats const *self) {
   printf("===\n"
          "[Stats]\n"
-         "  rate of change: %.2f Kg/day\n"
+         "  Weight rate of change: %.2f Kg/day\n"
+         "  BF rate of change: %.2f 1/day\n"
+         "  MM rate of change: %.2f 1/day\n"
+         "  WM rate of change: %.2f 1/day\n"
          "===\n",
-         self->rate_of_change);
+         self->weight_kg_rate_of_change, self->body_fat_percent_rate_of_change,
+         self->muscle_mass_percent_rate_of_change,
+         self->water_mass_percent_rate_of_change);
 }
 
 static int wt_cmd_execute(struct wt_cmd const *cmd) {
@@ -255,8 +301,15 @@ exit:
   return res;
 }
 
-static ssize_t wt_get_weight_history(char const *history_file_path,
-                                     float **history) {
+float wt_float_from_str(char const *str) {
+  if (strcmp(str, "NA") == 0) {
+    return strtof("nan", NULL);
+  }
+  return strtof(str, NULL);
+}
+
+static ssize_t wt_get_history(char const *history_file_path,
+                              struct wt_data **history) {
   int res = 0;
   FILE *f = fopen(history_file_path, "r");
   if (f == NULL) {
@@ -274,12 +327,28 @@ static ssize_t wt_get_weight_history(char const *history_file_path,
     goto cleanup;
   }
   while ((r = getline(&line, &length, f)) >= 0) {
+    struct wt_data data;
     char const *date = strtok(line, ",");
-    char const *weight_str = strtok(NULL, ",");
-    if (weight_str == NULL) {
+    char const *data_str = strtok(NULL, ",");
+    if (data_str == NULL) {
       continue;
     }
-    float const weight = strtof(weight_str, NULL);
+    data.weight_kg = wt_float_from_str(data_str);
+    data_str = strtok(NULL, ",");
+    if (data_str == NULL) {
+      continue;
+    }
+    data.body_fat_percent = wt_float_from_str(data_str);
+    data_str = strtok(NULL, ",");
+    if (data_str == NULL) {
+      continue;
+    }
+    data.muscle_mass_percent = wt_float_from_str(data_str);
+    data_str = strtok(NULL, ",");
+    if (data_str == NULL) {
+      continue;
+    }
+    data.water_mass_percent = wt_float_from_str(data_str);
     if (history_length == history_capacity) {
       history_capacity *= 2;
       *history = realloc(*history, history_capacity);
@@ -288,7 +357,7 @@ static ssize_t wt_get_weight_history(char const *history_file_path,
         goto cleanup;
       }
     }
-    (*history)[history_length++] = weight;
+    (*history)[history_length++] = data;
   }
   res = history_length;
 cleanup:
@@ -298,14 +367,29 @@ exit:
   return res;
 }
 
-static void wt_free_weight_history(float **history) {
+static void wt_free_history(struct wt_data **history) {
   free(*history);
   *history = NULL;
   return;
 }
 
-static ssize_t wt_moving_avg(size_t data_length, float data[data_length],
-                             size_t avg_window_length, float **data_avg) {
+#define wt_data_increment(sum, data, attr)                                     \
+  if (!isnan(data.attr)) {                                                     \
+    sum.attr += data.attr;                                                     \
+    attr##_cnt++;                                                              \
+  }
+
+#define wt_data_norm(sum, attr)                                                \
+  if (attr##_cnt != 0) {                                                       \
+    sum.attr /= attr##_cnt;                                                    \
+  } else {                                                                     \
+    sum.attr = nanf("nan");                                                    \
+  }
+
+static ssize_t wt_moving_avg(size_t data_length,
+                             struct wt_data data[data_length],
+                             size_t avg_window_length,
+                             struct wt_data **data_avg) {
   int res = 0;
   if (data_length < avg_window_length) {
     res = -1;
@@ -317,19 +401,32 @@ static ssize_t wt_moving_avg(size_t data_length, float data[data_length],
     goto exit;
   }
   for (size_t i = 0; i + avg_window_length - 1 < data_length; i++) {
-    float sum = 0;
+    struct wt_data sum = {0};
+    size_t weight_kg_cnt = 0;
+    size_t body_fat_percent_cnt = 0;
+    size_t muscle_mass_percent_cnt = 0;
+    size_t water_mass_percent_cnt = 0;
     for (size_t j = 0; j < avg_window_length; j++) {
-      sum += data[i + j];
+      struct wt_data d = data[i + j];
+      wt_data_increment(sum, d, weight_kg);
+      wt_data_increment(sum, d, body_fat_percent);
+      wt_data_increment(sum, d, muscle_mass_percent);
+      wt_data_increment(sum, d, water_mass_percent);
     }
-    float const avg = sum / avg_window_length;
-    (*data_avg)[i] = avg;
+    wt_data_norm(sum, weight_kg);
+    wt_data_norm(sum, body_fat_percent);
+    wt_data_norm(sum, muscle_mass_percent);
+    wt_data_norm(sum, water_mass_percent);
+    (*data_avg)[i] = sum;
   }
   res = data_length - avg_window_length + 1;
 exit:
   return res;
 }
+#undef wt_data_increment
+#undef wt_data_norm
 
-static void wt_free_moving_avg(float **data) {
+static void wt_free_moving_avg(struct wt_data **data) {
   free(*data);
   *data = NULL;
   return;
@@ -338,26 +435,29 @@ static void wt_free_moving_avg(float **data) {
 static int avg(void const *args) {
   int res = 0;
   struct wt_cmd_avg_args const *avg_args = args;
-  float *history = NULL;
-  ssize_t history_length = wt_get_weight_history(avg_args->file_path, &history);
+  struct wt_data *history = NULL;
+  ssize_t history_length = wt_get_history(avg_args->file_path, &history);
   if (history_length < 0) {
     res = -1;
     goto exit;
   }
-  float *history_avg = NULL;
+  struct wt_data *history_avg = NULL;
   ssize_t history_avg_length = wt_moving_avg(
       history_length, history, avg_args->avg_window_days, &history_avg);
   if (history_avg_length < 0) {
     res = -1;
     goto cleanup;
   }
-  printf("===\n[Moving Average Weight History]\n");
+  printf("===\n[Moving Average History]\n");
+  printf("  Weight, BF, MM, WM\n");
   for (size_t i = 0; i < history_avg_length; i++) {
-    printf("  %.2f Kg\n", history_avg[i]);
+    printf("  %.2f Kg, %.2f %%, %.2f %%, %.2f %%\n", history_avg[i].weight_kg,
+           history_avg[i].body_fat_percent, history_avg[i].muscle_mass_percent,
+           history_avg[i].water_mass_percent);
   }
   printf("===\n");
 cleanup:
-  wt_free_weight_history(&history);
+  wt_free_history(&history);
   wt_free_moving_avg(&history_avg);
 exit:
   return res;
@@ -366,9 +466,8 @@ exit:
 static int stats(void const *args) {
   int res = 0;
   struct wt_cmd_stats_args const *stats_args = args;
-  float *history;
-  ssize_t history_length =
-      wt_get_weight_history(stats_args->file_path, &history);
+  struct wt_data *history;
+  ssize_t history_length = wt_get_history(stats_args->file_path, &history);
   if (history_length < 0) {
     res = -1;
     goto exit;
@@ -378,7 +477,7 @@ static int stats(void const *args) {
     res = 0;
     goto exit;
   }
-  float *history_avg = NULL;
+  struct wt_data *history_avg = NULL;
   ssize_t history_avg_length = wt_moving_avg(
       history_length, history, stats_args->avg_window_days, &history_avg);
   if (history_avg_length < 0) {
@@ -393,7 +492,7 @@ static int stats(void const *args) {
   wt_stats_print(&stats);
   res = 0;
 cleanup:
-  wt_free_weight_history(&history);
+  wt_free_history(&history);
   wt_free_moving_avg(&history_avg);
   free(history_avg);
 exit:
