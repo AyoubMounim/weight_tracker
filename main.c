@@ -26,6 +26,7 @@ enum wt_cmd_tag {
   WT_CMD_LOG_DATA,
   WT_CMD_AVG,
   WT_CMD_STATS,
+  WT_CMD_SHOW,
   WT_CMDS_NUMBER,
 };
 
@@ -56,6 +57,10 @@ struct wt_cmd_stats_args {
   char file_path[FILE_PATH_MAX_SIZE];
 };
 
+struct wt_cmd_show_args {
+  char file_path[FILE_PATH_MAX_SIZE];
+};
+
 struct wt_cmd {
   enum wt_cmd_tag tag;
   int (*execute_func)(void const *);
@@ -64,6 +69,7 @@ struct wt_cmd {
     struct wt_cmd_log_data_args log_data_args;
     struct wt_cmd_avg_args avg_args;
     struct wt_cmd_stats_args stats_args;
+    struct wt_cmd_show_args show_args;
   };
 };
 
@@ -204,6 +210,9 @@ static int wt_cmd_execute(struct wt_cmd const *cmd) {
   case WT_CMD_STATS:
     res = cmd->execute_func((void *)&cmd->stats_args);
     break;
+  case WT_CMD_SHOW:
+    res = cmd->execute_func((void *)&cmd->show_args);
+    break;
   default:
     res = -1;
     break;
@@ -215,8 +224,8 @@ static int log_weight_get_fd(char const *path) {
   int fd;
   if (access(path, F_OK) != 0) {
     fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU);
-    static char const *header =
-        "weight_kg,body_fat_percent,muscle_mass_percent,water_mass_percent\n";
+    static char const *header = "day,weight(kg),body_fat(%),muscle_mass(%),"
+                                "water_mass(%)\n";
     write(fd, header, strlen(header));
   } else {
     fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU);
@@ -313,6 +322,39 @@ float wt_float_from_str(char const *str) {
     return strtof("nan", NULL);
   }
   return strtof(str, NULL);
+}
+
+static int wt_data_from_csv_line(char *line, char const **date,
+                                 struct wt_data *data) {
+  int res = 0;
+  *date = strtok(line, ",");
+  char *data_str = strtok(NULL, ",");
+  if (data_str == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->weight_kg = wt_float_from_str(data_str);
+  data_str = strtok(NULL, ",");
+  if (data_str == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->body_fat_percent = wt_float_from_str(data_str);
+  data_str = strtok(NULL, ",");
+  if (data_str == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data->muscle_mass_percent = wt_float_from_str(data_str);
+  data_str = strtok(NULL, ",");
+  if (data_str == NULL) {
+    res = -1;
+    goto exit;
+  }
+  data_str[strcspn(data_str, "\n")] = '\0';
+  data->water_mass_percent = wt_float_from_str(data_str);
+exit:
+  return res;
 }
 
 static ssize_t wt_get_history(char const *history_file_path,
@@ -506,6 +548,50 @@ exit:
   return res;
 }
 
+static int show(void const *args) {
+  static int const float_precision = 2;
+  static int const min_width = 15;
+  int res = 0;
+  struct wt_cmd_show_args const *show_args = args;
+  FILE *f = fopen(show_args->file_path, "r");
+  if (f == NULL) {
+    res = -1;
+    goto exit;
+  }
+  char *line = NULL;
+  size_t length = 0;
+  ssize_t r;
+  if ((r = getline(&line, &length, f)) >= 0) {
+    char *sections[5];
+    sections[0] = strtok(line, ",");
+    for (int i = 1; i < sizeof(sections) / sizeof(*sections); i++) {
+      sections[i] = strtok(NULL, ",");
+      if (sections[i] == NULL) {
+        sections[i] = "<ERROR>";
+        continue;
+      }
+      sections[i][strcspn(sections[i], "\n")] = '\0';
+    }
+    printf("|%*6$s|%*6$s|%*6$s|%*6$s|%*6$s|\n", sections[0], sections[1],
+           sections[2], sections[3], sections[4], -min_width);
+  }
+  while ((r = getline(&line, &length, f)) >= 0) {
+    char const *date;
+    struct wt_data data;
+    if (wt_data_from_csv_line(line, &date, &data) < 0) {
+      printf("<ERROR>\n");
+      continue;
+    }
+    printf("|%-*7$s|%*7$.*6$f|%*7$.*6$f|%*7$.*6$f|%*7$.*6$f|\n", date,
+           data.weight_kg, data.body_fat_percent, data.muscle_mass_percent,
+           data.water_mass_percent, float_precision, min_width);
+  }
+  free(line);
+  fclose(f);
+exit:
+  return res;
+}
+
 static int parse_args(int argc, char *argv[], struct wt_cmd *cmd) {
   int res = -1;
   if (argc < 2) {
@@ -575,8 +661,29 @@ static int parse_args(int argc, char *argv[], struct wt_cmd *cmd) {
       assert(0 && "not implemented");
     }
     res = 0;
+  } else if (strcmp(argv[1], "show") == 0) {
+    cmd->tag = WT_CMD_SHOW;
+    cmd->execute_func = show;
+    if (argc == 2) {
+      char const *home = getenv("HOME");
+      int length = snprintf(cmd->show_args.file_path, FILE_PATH_MAX_SIZE,
+                            "%s/%s", home, WEIGHT_HISTORY_DEFAULT_FILE);
+      if (length == FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+    } else if (argc == 3) {
+      if (strlen(argv[2]) >= FILE_PATH_MAX_SIZE) {
+        res = -1;
+        goto exit;
+      }
+      strcpy(cmd->show_args.file_path, argv[2]);
+    } else {
+      assert(0 && "not implemented");
+    }
+    res = 0;
   } else {
-    res = -1;
+    assert(0 && "not implemented");
   }
 exit:
   return res;
